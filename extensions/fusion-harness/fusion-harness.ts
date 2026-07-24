@@ -40,7 +40,7 @@
  *
  * Plumbing: every agent is a spawned `pi --mode json -p` subprocess with a
  * fully-qualified `provider/id` model and a throwaway --session-dir under a
- * per-run /tmp/fusion-harness-* artifacts dir. Nothing is written to the repo.
+ * per-run .scratch/fusion-harness/ artifacts dir. Nothing is written to the repo.
  *
  * Flags:
  *   --architect <provider/id>   plans / fuses / validates  (default anthropic/claude-fable-5)
@@ -434,7 +434,7 @@ function mdLines(text: string, colW: number): string[] {
 /**
  * Spawn one `pi --mode json -p` child agent and stream its JSON events into `run`.
  * Final answer = last assistant text part. The child writes its session into a
- * throwaway --session-dir under the run's /tmp artifacts dir.
+ * throwaway --session-dir under the run's artifacts dir.
  */
 function runChild(opts: {
 	run: AgentRun; // mutated live
@@ -452,8 +452,8 @@ function runChild(opts: {
 }): Promise<AgentRun> {
 	const run = opts.run;
 	run.thinking = opts.thinking;
-	// Clean-room spawn: children never load skills, extensions (recursion guard), or
-	// context files — their entire contract comes from the harness's prompt files.
+	// Children inherit repo skills and context files, but extensions are disabled to
+	// prevent recursive fusion-harness loading.
 	const args: string[] = [
 		"--mode",
 		"json",
@@ -1091,7 +1091,7 @@ export default function (pi: ExtensionAPI) {
 	// ── 8.4 Persistent per-role sessions ───────────────────────
 	// The SAME session id is reused for a role across EVERY execution in this project —
 	// including across pi restarts — via a manifest at
-	// /tmp/fusion-harness-sessions/<project>/manifest.json. ARCHITECT and BUILDER keep
+	// .scratch/fusion-harness-sessions/<project>/manifest.json. ARCHITECT and BUILDER keep
 	// their context until /fh-reset. (FUSION stays fresh — the merge must judge the two
 	// answers without prior contamination.)
 	const projectSlug = (cwd: string): string =>
