@@ -216,6 +216,33 @@ export function formatStatus(rows: RunIndexRow[]): string {
 	return lines.join("\n");
 }
 
+
+export function listRunsPayload(rows: RunIndexRow[]): {
+	index: number;
+	id: string;
+	shortId: string;
+	command?: string;
+	ok?: boolean;
+	archived?: boolean;
+	cost?: number;
+	durationMs?: number;
+	ts: string;
+	topic?: string;
+}[] {
+	return rows.map((r, i) => ({
+		index: i + 1,
+		id: r.dir,
+		shortId: shortDir(r.dir),
+		command: r.command,
+		ok: r.ok,
+		archived: r.archived,
+		cost: r.cost,
+		durationMs: r.durationMs,
+		ts: r.ts,
+		topic: r.prompt,
+	}));
+}
+
 export function parseCleanArgs(raw: string): { keep: number; all: boolean } {
 	const parts = raw.trim().split(/\s+/).filter(Boolean);
 	let keep = 3;
@@ -247,7 +274,7 @@ export function unarchivedHighValue(artifactRoot: string, rows: RunIndexRow[]): 
 	return out;
 }
 
-function resolveRun(rows: RunIndexRow[], token: string | undefined): RunIndexRow | undefined {
+export function resolveRun(rows: RunIndexRow[], token: string | undefined): RunIndexRow | undefined {
 	if (!token) return undefined;
 	const t = token.trim();
 	return rows.find((r) => r.dir === t || r.dir === path.basename(t) || shortDir(r.dir) === t || r.dir.endsWith(t));
@@ -276,18 +303,9 @@ export function formatArchiveInventory(artifactRoot: string, run: RunIndexRow): 
 	}
 	lines.push(
 		``,
-		`### Agent instructions (do NOT invent dumb path slugs)`,
-		`1. Read this inventory + repo AGENTS.md / docs conventions.`,
-		`2. Propose an archive plan for the user:`,
-		`   - which files to keep (default: ★ only; drop fused.md unless user asks)`,
-		`   - target directory`,
-		`   - **title-based filename(s)** summarizing the content (human-readable, repo style)`,
-		`3. Wait for user edits (dir / names / file set).`,
-		`4. After explicit confirmation, run:`,
-		`   /fusion-housekeep apply ${run.dir} <src>=<dest> [<src>=<dest> ...]`,
-		`   Example:`,
-		`   /fusion-housekeep apply ${run.dir} fused-report-x.md=docs/plans/my-wiki-getting-started-review.md`,
-		`Dest paths are relative to cwd unless absolute. apply copies then marks archived.`,
+		`### For the agent`,
+		`Default keep: ★ files only (not fused.md). Propose title-based dest paths from content + repo conventions.`,
+		`After user confirms, call tool fusion_archive_apply (not slash re-runs).`,
 	);
 	return lines.join("\n");
 }
@@ -393,9 +411,7 @@ export async function handleHousekeep(
 				[
 					formatStatus(rows),
 					``,
-					`Pick a run, then re-run: /fusion-housekeep archive <dir-or-short-id>`,
-					`Agent will receive inventory and must propose title/paths for user confirmation.`,
-					`Do not auto-copy. fused.md is not a default high-value file.`,
+					`(fallback) Prefer agent workflow via /fusion-housekeep archive which injects the agent.`,
 				].join("\n"),
 				"info",
 			);

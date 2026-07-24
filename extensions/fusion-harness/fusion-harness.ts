@@ -66,8 +66,17 @@ import { randomUUID } from "node:crypto"; // persistent per-role session ids
 import * as fs from "node:fs"; // prompt files, artifacts, session manifests
 import * as os from "node:os"; // tmpdir fallback when /tmp is missing
 import * as path from "node:path"; // every artifact/session path
-import { appendIndexFromSummary, handleHousekeep } from "./housekeep";
+import {
+	appendIndexFromSummary,
+	applyArchiveMaps,
+	formatArchiveInventory,
+	handleHousekeep,
+	listRunsPayload,
+	reconcileIndex,
+	resolveRun,
+} from "./housekeep";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
 import { Box, Container, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 // ═══ 1. Defaults ═════════════════════════════════════════════════════════════
@@ -2519,10 +2528,104 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── /fusion-housekeep status|archive|clean ───────────────
+	// ── tools: agent-driven housekeep (archive UX lives in the agent) ──
+	const toolText = (text: string) => ({ content: [{ type: "text" as const, text }] });
+
+	pi.registerTool({
+		name: "fusion_list_runs",
+		label: "Fusion list runs",
+		description: "List .scratch/fusion-harness runs with topic/command/cost for archive housekeep. Prefer this over asking the user to re-run slash commands.",
+		parameters: Type.Object({}),
+		async execute() {
+			const rows = reconcileIndex(ARTIFACT_ROOT);
+			return toolText(JSON.stringify({ runs: listRunsPayload(rows) }, null, 2));
+		},
+	});
+
+	pi.registerTool({
+		name: "fusion_run_inventory",
+		label: "Fusion run inventory",
+		description: "Detailed file inventory for one fusion-harness run (paths, peeks, high-value flags). Pass dir or short id from fusion_list_runs.",
+		parameters: Type.Object({
+			dir: Type.String({ description: "Run dir, short id, or basename (e.g. VliU1E or fusion-harness-VliU1E)" }),
+		}),
+		async execute(_id, params: { dir: string }) {
+			const rows = reconcileIndex(ARTIFACT_ROOT);
+			const run = resolveRun(rows, params.dir);
+			if (!run) return toolText(JSON.stringify({ error: `run not found: ${params.dir}` }));
+			return toolText(formatArchiveInventory(ARTIFACT_ROOT, run));
+		},
+	});
+
+	pi.registerTool({
+		name: "fusion_archive_apply",
+		label: "Fusion archive apply",
+		description: "Copy selected run files to destination paths and mark the run archived. Only after user confirmed the plan.",
+		parameters: Type.Object({
+			dir: Type.String({ description: "Run dir or short id" }),
+			mappings: Type.Array(
+				Type.Object({
+					from: Type.String({ description: "Source filename inside the run dir" }),
+					to: Type.String({ description: "Destination path relative to cwd or absolute" }),
+				}),
+				{ minItems: 1 },
+			),
+		}),
+		async execute(_id, params: { dir: string; mappings: { from: string; to: string }[] }, _sig, _up, ctx: any) {
+			const rows = reconcileIndex(ARTIFACT_ROOT);
+			const run = resolveRun(rows, params.dir);
+			if (!run) return toolText(JSON.stringify({ error: `run not found: ${params.dir}` }));
+			const cwd = ctx?.cwd ?? process.cwd();
+			const result = applyArchiveMaps(ARTIFACT_ROOT, run, params.mappings, cwd);
+			return toolText(JSON.stringify(result, null, 2));
+		},
+	});
+
+	const ARCHIVE_AGENT_PROMPT = `You are driving **fusion-harness archive housekeep** for this repository.
+
+## UX rules
+- YOU own the interaction. Use the **question** tool (or clear multi-choice) — do **not** dump script menus or tell the user to "re-run /fusion-housekeep archive <id>".
+- Accept short answers like \`2\` as selecting item #2 from the last list you showed.
+- Do **not** auto-copy. Wait for explicit user confirmation of the plan.
+- Default high-value: \`fused-report*.md\` and \`gate.py\` only. **\`fused.md\` is not high-value** unless the user asks.
+
+## Workflow
+1. Call tool \`fusion_list_runs\` (silent data). Group runs by theme for the user in plain language.
+2. Ask which run(s) to archive (question tool / numbered list).
+3. Call \`fusion_run_inventory\` for the chosen run id.
+4. Read repo \`AGENTS.md\` / docs naming conventions. Propose:
+   - files to keep
+   - target directory
+   - **human title-based filenames** (summarize content; no dumb path slugs like bare \`getting-started\`)
+5. Let the user revise freely (dir / names / file set).
+6. After confirmation only, call \`fusion_archive_apply\` with \`{ dir, mappings: [{from,to}, ...] }\`.
+
+$FOCUS
+`;
+
+	// ── /fusion-housekeep — archive is agent-driven; status/clean stay scripted ──
 	pi.registerCommand("fusion-housekeep", {
-		description: "Manage fusion-harness runs: status | archive [dir] (agent inventory) | apply <dir> src=dest... | clean",
+		description: "Housekeep fusion runs. archive → agent workflow (question UX). status|clean|apply also available.",
 		handler: async (raw, ctx) => {
+			const trimmed = (raw ?? "").trim();
+			const space = trimmed.indexOf(" ");
+			const sub = (space === -1 ? trimmed : trimmed.slice(0, space)).toLowerCase();
+			const rest = space === -1 ? "" : trimmed.slice(space + 1).trim();
+
+			// Default and "archive" → inject agent-driven workflow (no script menu UX)
+			if (!sub || sub === "archive") {
+				const focus = rest
+					? `User hint / pre-selected focus: "${rest}". If this is a number or run id, treat it as their selection when possible.`
+					: "No pre-selection. List runs and let the user choose.";
+				const prompt = ARCHIVE_AGENT_PROMPT.replace("$FOCUS", focus);
+				ctx.ui.notify("fusion-housekeep: starting agent-driven archive…", "info");
+				if (typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+					await ctx.waitForIdle();
+				}
+				pi.sendUserMessage(prompt);
+				return;
+			}
+
 			await handleHousekeep(raw ?? "", ctx, ARTIFACT_ROOT);
 		},
 	});

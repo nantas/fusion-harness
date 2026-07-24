@@ -52,7 +52,7 @@ if (!String(notes[0] || "").includes("Usage")) throw new Error("no-args should s
 notes.length = 0;
 await handleHousekeep("archive fusion-harness-a", { ui: { notify: (m) => notes.push(m) } }, root);
 const inv = notes.join("\n");
-if (!inv.includes("Agent instructions") || !inv.includes("fused-report-x.md")) throw new Error("inventory bad");
+if (!inv.includes("For the agent") || !inv.includes("fused-report-x.md")) throw new Error("inventory bad");
 if (inv.includes("★ fused.md")) throw new Error("fused.md should not be star");
 
 const parsed = parseApplyArgs("fusion-harness-a fused-report-x.md=docs/plans/my-title-review.md gate.py=docs/plans/my-title-gate.py");
