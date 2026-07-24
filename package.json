@@ -1,8 +1,13 @@
 {
   "name": "fusion-harness",
-  "version": "0.1.3",
-  "description": "FUSE frontier models instead of racing them. AND, not OR. Three slash commands: /opinion, /fusion, /auto-validate.",
-  "keywords": ["pi-package", "pi-extension", "multi-model", "fusion"],
+  "version": "0.1.4",
+  "description": "FUSE frontier models instead of racing them. AND, not OR. Commands: /opinion, /fusion, /auto-validate, /fusion-housekeep.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "multi-model",
+    "fusion"
+  ],
   "license": "MIT",
   "author": {
     "name": "Dan Eisler (IndyDevDan)"

@@ -66,6 +66,7 @@ import { randomUUID } from "node:crypto"; // persistent per-role session ids
 import * as fs from "node:fs"; // prompt files, artifacts, session manifests
 import * as os from "node:os"; // tmpdir fallback when /tmp is missing
 import * as path from "node:path"; // every artifact/session path
+import { appendIndexFromSummary, handleHousekeep } from "./housekeep";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
@@ -1682,6 +1683,14 @@ export default function (pi: ExtensionAPI) {
 	const mkArtifacts = async (): Promise<string> => fs.promises.mkdtemp(path.join(ARTIFACT_ROOT, "fusion-harness-"));
 	const save = (dir: string, name: string, body: string) =>
 		fs.promises.writeFile(path.join(dir, name), body, "utf-8").catch(() => {});
+	const saveSummary = async (dir: string, summary: Record<string, unknown>) => {
+		await save(dir, "summary.json", JSON.stringify(summary, null, 2));
+		try {
+			appendIndexFromSummary(ARTIFACT_ROOT, dir, summary);
+		} catch {
+			/* index is best-effort */
+		}
+	};
 	const totals = (runs: AgentRun[], startedAt: number) => ({
 		totalMs: Date.now() - startedAt,
 		totalCostUsd: runs.reduce((s, r) => s + r.costUsd, 0),
@@ -1792,6 +1801,11 @@ export default function (pi: ExtensionAPI) {
 			const startedAt = Date.now();
 			const artifactsDir = await mkArtifacts();
 			await save(artifactsDir, "prompt.md", `${prompt}\n\nFUSION INSTRUCTION:\n${fusionInstruction}`);
+			let summarySaved = false;
+			const commitSummary = async (summary: Record<string, unknown>) => {
+				summarySaved = true;
+				await saveSummary(artifactsDir, summary);
+			};
 
 			// Echo what was asked as a normal user-style message — the transcript stays readable.
 			panel({ kind: "prompt", command: "fusion", ok: true }, `/fusion ${input}`);
@@ -1941,16 +1955,11 @@ export default function (pi: ExtensionAPI) {
 						"The two side-by-side answers above are still valid — only the fusion step failed.",
 					);
 				}
-				await save(
-					artifactsDir,
-					"summary.json",
-					JSON.stringify(
-						{ command: "fusion", ok: runOk(fuser), agents: [toStat(architect), toStat(builder), toStat(fuser)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t },
-						null,
-						2,
-					),
-				);
+				await commitSummary( { command: "fusion", ok: runOk(fuser), agents: [toStat(architect), toStat(builder), toStat(fuser)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t });
 			} finally {
+				if (!summarySaved) {
+					await commitSummary({ command: "fusion", ok: false, partial: true });
+				}
 				stopper.release(); // never leave the escape tap installed past the command
 				stopWidget();
 				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
@@ -2005,6 +2014,11 @@ export default function (pi: ExtensionAPI) {
 			const startedAt = Date.now();
 			const artifactsDir = await mkArtifacts();
 			await save(artifactsDir, "prompt.md", prompt);
+			let summarySaved = false;
+			const commitSummary = async (summary: Record<string, unknown>) => {
+				summarySaved = true;
+				await saveSummary(artifactsDir, summary);
+			};
 
 			panel({ kind: "prompt", command: "auto-validate", ok: true }, `/auto-validate ${(raw ?? "").trim()}`);
 			panel(
@@ -2226,15 +2240,7 @@ export default function (pi: ExtensionAPI) {
 						`${builderBody}\n\n${gateBody}`,
 					);
 					if (ok) {
-						await save(
-							artifactsDir,
-							"summary.json",
-							JSON.stringify(
-								{ command: "auto-validate", ok: true, rounds: round, maxValidations: maxV, escalateAt, gateExitCode: 0, agents: [toStat(validator), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t },
-								null,
-								2,
-							),
-						);
+						await commitSummary( { command: "auto-validate", ok: true, rounds: round, maxValidations: maxV, escalateAt, gateExitCode: 0, agents: [toStat(validator), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t });
 						return;
 					}
 
@@ -2364,15 +2370,7 @@ export default function (pi: ExtensionAPI) {
 											},
 											`${builderBody}\n\n${gateBody}`,
 										);
-										await save(
-											artifactsDir,
-											"summary.json",
-											JSON.stringify(
-												{ command: "auto-validate", ok: true, rounds: round, gateRepaired: true, maxValidations: maxV, escalateAt, gateExitCode: 0, agents: [toStat(validator), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t },
-												null,
-												2,
-											),
-										);
+										await commitSummary( { command: "auto-validate", ok: true, rounds: round, gateRepaired: true, maxValidations: maxV, escalateAt, gateExitCode: 0, agents: [toStat(validator), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t });
 										return;
 									}
 									// Still red on a now-sound gate: those failures are real — hand them
@@ -2406,16 +2404,11 @@ export default function (pi: ExtensionAPI) {
 					].join("\n"),
 					{ round: maxV },
 				);
-				await save(
-					artifactsDir,
-					"summary.json",
-					JSON.stringify(
-						{ command: "auto-validate", ok: false, halted: true, rounds: maxV, maxValidations: maxV, escalateAt, gateExitCode: lastGate?.code, agents: [toStat(validator), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...totals([validator, builder], startedAt) },
-						null,
-						2,
-					),
-				);
+				await commitSummary( { command: "auto-validate", ok: false, halted: true, rounds: maxV, maxValidations: maxV, escalateAt, gateExitCode: lastGate?.code, agents: [toStat(validator), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...totals([validator, builder], startedAt) });
 			} finally {
+				if (!summarySaved) {
+					await commitSummary({ command: "auto-validate", ok: false, partial: true });
+				}
 				stopper.release(); // never leave the escape tap installed past the command
 				stopWidget();
 				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
@@ -2437,6 +2430,11 @@ export default function (pi: ExtensionAPI) {
 			const startedAt = Date.now();
 			const artifactsDir = await mkArtifacts();
 			await save(artifactsDir, "prompt.md", prompt);
+			let summarySaved = false;
+			const commitSummary = async (summary: Record<string, unknown>) => {
+				summarySaved = true;
+				await saveSummary(artifactsDir, summary);
+			};
 
 			panel({ kind: "prompt", command: "opinion", ok: true }, `/opinion ${prompt}`);
 			const architect = newRun("ARCHITECT", aModel);
@@ -2509,20 +2507,23 @@ export default function (pi: ExtensionAPI) {
 					},
 					fallback,
 				);
-				await save(
-					artifactsDir,
-					"summary.json",
-					JSON.stringify(
-						{ command: "opinion", ok, agents: [toStat(architect), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t },
-						null,
-						2,
-					),
-				);
+				await commitSummary( { command: "opinion", ok, agents: [toStat(architect), toStat(builder)], sessions: { architect: cachedRoleId("architect"), builder: cachedRoleId("builder") }, ...t });
 			} finally {
+				if (!summarySaved) {
+					await commitSummary({ command: "opinion", ok: false, partial: true });
+				}
 				stopper.release(); // never leave the escape tap installed past the command
 				stopWidget();
 				ctx.ui.setStatus(CUSTOM_TYPE, undefined);
 			}
+		},
+	});
+
+	// ── /fusion-housekeep status|archive|clean ───────────────
+	pi.registerCommand("fusion-housekeep", {
+		description: "Manage fusion-harness run artifacts: status | archive [dir] | clean [--keep N|--all]",
+		handler: async (raw, ctx) => {
+			await handleHousekeep(raw ?? "", ctx, ARTIFACT_ROOT);
 		},
 	});
 }

@@ -1,0 +1,362 @@
+/**
+ * fusion-housekeep — run index + status/archive/clean for ARTIFACT_ROOT.
+ * Pure fs helpers; command handler uses ctx.ui only.
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+export type RunIndexRow = {
+	ts: string;
+	command?: string;
+	ok?: boolean;
+	dir: string;
+	cost?: number;
+	durationMs?: number;
+	prompt?: string;
+	archived?: boolean;
+	copied?: { from: string; to: string }[];
+};
+
+const SESSIONS_DIR = "fusion-harness-sessions";
+const INDEX_NAME = "run-index.jsonl";
+const HIGH_VALUE_NAMES = new Set(["fused.md", "gate.py"]);
+
+export function indexPath(artifactRoot: string): string {
+	return path.join(artifactRoot, INDEX_NAME);
+}
+
+export function listRunDirs(artifactRoot: string): string[] {
+	if (!fs.existsSync(artifactRoot)) return [];
+	return fs
+		.readdirSync(artifactRoot, { withFileTypes: true })
+		.filter((d) => d.isDirectory() && d.name.startsWith("fusion-harness-") && d.name !== SESSIONS_DIR)
+		.map((d) => d.name);
+}
+
+export function isHighValueName(name: string): boolean {
+	return HIGH_VALUE_NAMES.has(name) || (name.startsWith("fused-report") && name.endsWith(".md"));
+}
+
+export function highValueFiles(runDirAbs: string): string[] {
+	if (!fs.existsSync(runDirAbs)) return [];
+	return fs
+		.readdirSync(runDirAbs, { withFileTypes: true })
+		.filter((d) => d.isFile() && isHighValueName(d.name))
+		.map((d) => d.name)
+		.sort();
+}
+
+export function readIndex(artifactRoot: string): RunIndexRow[] {
+	const p = indexPath(artifactRoot);
+	if (!fs.existsSync(p)) return [];
+	const rows: RunIndexRow[] = [];
+	for (const line of fs.readFileSync(p, "utf-8").split("\n")) {
+		const t = line.trim();
+		if (!t) continue;
+		try {
+			const o = JSON.parse(t) as RunIndexRow;
+			if (o && typeof o.dir === "string") rows.push(o);
+		} catch {
+			/* skip bad line */
+		}
+	}
+	return rows;
+}
+
+/** Atomic-ish rewrite: write tmp then rename. */
+export function writeIndex(artifactRoot: string, rows: RunIndexRow[]): void {
+	fs.mkdirSync(artifactRoot, { recursive: true });
+	const p = indexPath(artifactRoot);
+	const tmp = `${p}.${process.pid}.tmp`;
+	const body = rows.map((r) => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : "");
+	fs.writeFileSync(tmp, body, "utf-8");
+	fs.renameSync(tmp, p);
+}
+
+function dirMtimeIso(runDirAbs: string): string {
+	try {
+		return fs.statSync(runDirAbs).mtime.toISOString();
+	} catch {
+		return new Date(0).toISOString();
+	}
+}
+
+function guessCommand(runDirAbs: string): string | undefined {
+	const names = new Set(fs.existsSync(runDirAbs) ? fs.readdirSync(runDirAbs) : []);
+	if (names.has("gate.py") || names.has("validator.md")) return "auto-validate";
+	if ([...names].some((n) => n === "fused.md" || n.startsWith("fused-report"))) return "fusion";
+	if (names.has("architect.md") && names.has("builder.md")) return "opinion"; // or fusion mid-fail
+	return undefined;
+}
+
+export function rowFromSummary(dirBasename: string, summary: Record<string, unknown> | null | undefined, runDirAbs?: string): RunIndexRow {
+	const s = summary ?? {};
+	const cost = typeof s.totalCostUsd === "number" ? s.totalCostUsd : undefined;
+	const durationMs = typeof s.totalMs === "number" ? s.totalMs : undefined;
+	const command = typeof s.command === "string" ? s.command : runDirAbs ? guessCommand(runDirAbs) : undefined;
+	const ok = typeof s.ok === "boolean" ? s.ok : undefined;
+	const ts = runDirAbs ? dirMtimeIso(runDirAbs) : new Date().toISOString();
+	return {
+		ts,
+		command,
+		ok,
+		dir: dirBasename,
+		cost,
+		durationMs,
+	};
+}
+
+function loadSummary(runDirAbs: string): Record<string, unknown> | null {
+	const p = path.join(runDirAbs, "summary.json");
+	if (!fs.existsSync(p)) return null;
+	try {
+		return JSON.parse(fs.readFileSync(p, "utf-8")) as Record<string, unknown>;
+	} catch {
+		return null;
+	}
+}
+
+/** Scan dirs → rebuild index, preserving archived/copied from prior index. */
+export function reconcileIndex(artifactRoot: string): RunIndexRow[] {
+	const prev = new Map(readIndex(artifactRoot).map((r) => [r.dir, r]));
+	const dirs = listRunDirs(artifactRoot);
+	const next: RunIndexRow[] = [];
+	for (const dir of dirs) {
+		const abs = path.join(artifactRoot, dir);
+		const summary = loadSummary(abs);
+		const base = rowFromSummary(dir, summary, abs);
+		const old = prev.get(dir);
+		if (old?.archived) base.archived = true;
+		if (old?.copied?.length) base.copied = old.copied;
+		// Prefer fresher summary fields; keep old ts only if we have no mtime signal
+		if (old?.ts && (!summary || !fs.existsSync(abs))) base.ts = old.ts;
+		if (old?.prompt && !base.prompt) base.prompt = old.prompt;
+		next.push(base);
+	}
+	// Sort newest first
+	next.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+	writeIndex(artifactRoot, next);
+	return next;
+}
+
+/** Upsert one row by dir (dual-write from command completion). */
+export function upsertIndexRow(artifactRoot: string, row: RunIndexRow): void {
+	const rows = readIndex(artifactRoot);
+	const i = rows.findIndex((r) => r.dir === row.dir);
+	if (i >= 0) {
+		const prev = rows[i];
+		rows[i] = {
+			...prev,
+			...row,
+			archived: row.archived ?? prev.archived,
+			copied: row.copied ?? prev.copied,
+		};
+	} else {
+		rows.push(row);
+	}
+	rows.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+	writeIndex(artifactRoot, rows);
+}
+
+export function appendIndexFromSummary(artifactRoot: string, artifactsDirAbs: string, summary: Record<string, unknown>): void {
+	const dir = path.basename(artifactsDirAbs);
+	const row = rowFromSummary(dir, summary, artifactsDirAbs);
+	row.ts = new Date().toISOString();
+	upsertIndexRow(artifactRoot, row);
+}
+
+export function formatStatus(rows: RunIndexRow[]): string {
+	if (!rows.length) return "fusion-housekeep: no runs under .scratch/fusion-harness/";
+	const lines = ["fusion-housekeep status", "─".repeat(60)];
+	for (const r of rows) {
+		const cmd = r.command ?? "?";
+		const ok = r.ok === true ? "ok" : r.ok === false ? "FAIL" : "?";
+		const arch = r.archived ? " archived" : "";
+		const cost = r.cost != null ? ` $${r.cost.toFixed(4)}` : "";
+		const dur = r.durationMs != null ? ` ${Math.round(r.durationMs / 1000)}s` : "";
+		lines.push(`${r.dir}  ${cmd}  ${ok}${arch}${cost}${dur}  ${r.ts}`);
+	}
+	return lines.join("\n");
+}
+
+export function parseCleanArgs(raw: string): { keep: number; all: boolean } {
+	const parts = raw.trim().split(/\s+/).filter(Boolean);
+	let keep = 3;
+	let all = false;
+	for (let i = 0; i < parts.length; i++) {
+		const p = parts[i];
+		if (p === "--all") all = true;
+		else if (p === "--keep" && parts[i + 1]) {
+			const n = Number(parts[++i]);
+			if (Number.isFinite(n) && n >= 0) keep = Math.floor(n);
+		} else if (/^--keep=\d+$/.test(p)) {
+			keep = Math.floor(Number(p.slice("--keep=".length)));
+		}
+	}
+	if (all) keep = 0;
+	return { keep, all };
+}
+
+export function planClean(rows: RunIndexRow[], keep: number): RunIndexRow[] {
+	const sorted = [...rows].sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+	return sorted.slice(Math.max(0, keep));
+}
+
+export function unarchivedHighValue(artifactRoot: string, rows: RunIndexRow[]): { dir: string; files: string[] }[] {
+	const out: { dir: string; files: string[] }[] = [];
+	for (const r of rows) {
+		if (r.archived) continue;
+		const files = highValueFiles(path.join(artifactRoot, r.dir));
+		if (files.length) out.push({ dir: r.dir, files });
+	}
+	return out;
+}
+
+async function confirmYes(ctx: { ui: { input?: (p: string, d?: string) => Promise<string | undefined>; notify: (m: string, l?: string) => void } }, prompt: string): Promise<boolean> {
+	if (typeof ctx.ui.input !== "function") {
+		ctx.ui.notify("fusion-housekeep: no interactive input — aborting destructive action", "warning");
+		return false;
+	}
+	const ans = (await ctx.ui.input(prompt, "n"))?.trim().toLowerCase() ?? "n";
+	return ans === "y" || ans === "yes";
+}
+
+async function pickRun(
+	ctx: { ui: { input?: (p: string, d?: string) => Promise<string | undefined>; notify: (m: string, l?: string) => void } },
+	rows: RunIndexRow[],
+	argDir?: string,
+): Promise<RunIndexRow | undefined> {
+	if (argDir) {
+		const base = path.basename(argDir);
+		const hit = rows.find((r) => r.dir === base || r.dir === argDir);
+		if (!hit) {
+			ctx.ui.notify(`fusion-housekeep: run not found: ${argDir}`, "error");
+			return undefined;
+		}
+		return hit;
+	}
+	if (!rows.length) {
+		ctx.ui.notify("fusion-housekeep: no runs to archive", "warning");
+		return undefined;
+	}
+	if (rows.length === 1) return rows[0];
+	const list = rows.map((r, i) => `  ${i + 1}. ${r.dir}  ${r.command ?? "?"}  ${r.archived ? "archived" : ""}`).join("\n");
+	ctx.ui.notify(`Select run:\n${list}`, "info");
+	if (typeof ctx.ui.input !== "function") {
+		ctx.ui.notify("fusion-housekeep: pass archive <dir> when input is unavailable", "warning");
+		return undefined;
+	}
+	const ans = (await ctx.ui.input("Run number or dir basename:", "1"))?.trim() ?? "";
+	const n = Number(ans);
+	if (Number.isFinite(n) && n >= 1 && n <= rows.length) return rows[n - 1];
+	return rows.find((r) => r.dir === ans || r.dir === path.basename(ans));
+}
+
+export async function handleHousekeep(
+	rawArgs: string,
+	ctx: { ui: { input?: (p: string, d?: string) => Promise<string | undefined>; notify: (m: string, l?: string) => void }; cwd?: string },
+	artifactRoot: string,
+): Promise<void> {
+	const trimmed = (rawArgs ?? "").trim();
+	const space = trimmed.indexOf(" ");
+	const sub = (space === -1 ? trimmed : trimmed.slice(0, space)).toLowerCase();
+	const rest = space === -1 ? "" : trimmed.slice(space + 1).trim();
+
+	if (!sub || !["status", "archive", "clean"].includes(sub)) {
+		ctx.ui.notify(
+			"Usage:\n  /fusion-housekeep status\n  /fusion-housekeep archive [dir]\n  /fusion-housekeep clean [--keep N | --all]",
+			"warning",
+		);
+		return;
+	}
+
+	const rows = reconcileIndex(artifactRoot);
+
+	if (sub === "status") {
+		ctx.ui.notify(formatStatus(rows), "info");
+		return;
+	}
+
+	if (sub === "archive") {
+		const run = await pickRun(ctx, rows, rest || undefined);
+		if (!run) return;
+		const abs = path.join(artifactRoot, run.dir);
+		const files = highValueFiles(abs);
+		if (!files.length) {
+			run.archived = true;
+			upsertIndexRow(artifactRoot, run);
+			// re-write full reconciled with archived flag
+			const all = reconcileIndex(artifactRoot);
+			const r = all.find((x) => x.dir === run.dir);
+			if (r) {
+				r.archived = true;
+				writeIndex(artifactRoot, all);
+			}
+			ctx.ui.notify(`fusion-housekeep: ${run.dir} — no high-value files; marked archived`, "info");
+			return;
+		}
+		const copied: { from: string; to: string }[] = [...(run.copied ?? [])];
+		for (const name of files) {
+			const from = path.join(abs, name);
+			if (typeof ctx.ui.input !== "function") {
+				ctx.ui.notify(`fusion-housekeep: skip ${name} (no input API)`, "warning");
+				continue;
+			}
+			const dest = (await ctx.ui.input(`Copy ${name} to (empty=skip):`, ""))?.trim() ?? "";
+			if (!dest) continue;
+			const toAbs = path.isAbsolute(dest) ? dest : path.join(ctx.cwd ?? process.cwd(), dest);
+			try {
+				fs.mkdirSync(path.dirname(toAbs), { recursive: true });
+				fs.copyFileSync(from, toAbs);
+				copied.push({ from: name, to: toAbs });
+				ctx.ui.notify(`copied ${name} → ${toAbs}`, "info");
+			} catch (e) {
+				ctx.ui.notify(`fusion-housekeep: failed to copy ${name}: ${e instanceof Error ? e.message : String(e)}`, "error");
+			}
+		}
+		const all = reconcileIndex(artifactRoot);
+		const r = all.find((x) => x.dir === run.dir);
+		if (r) {
+			r.archived = true;
+			r.copied = copied;
+			writeIndex(artifactRoot, all);
+		}
+		ctx.ui.notify(`fusion-housekeep: ${run.dir} archived (${copied.length} file(s) copied)`, "info");
+		return;
+	}
+
+	// clean
+	const { keep } = parseCleanArgs(rest);
+	const deleteSet = planClean(rows, keep);
+	if (!deleteSet.length) {
+		ctx.ui.notify(`fusion-housekeep: nothing to clean (keep ${keep}, have ${rows.length})`, "info");
+		return;
+	}
+	const danger = unarchivedHighValue(artifactRoot, deleteSet);
+	if (danger.length) {
+		const list = danger.map((d) => `  ${d.dir}: ${d.files.join(", ")}`).join("\n");
+		ctx.ui.notify(`High-value unarchived files in delete set:\n${list}`, "warning");
+		const ok = await confirmYes(ctx, `Delete ${deleteSet.length} run(s) including the above? [y/N]`);
+		if (!ok) {
+			ctx.ui.notify("fusion-housekeep: clean aborted", "info");
+			return;
+		}
+	} else {
+		const ok = await confirmYes(ctx, `Delete ${deleteSet.length} run dir(s) (keep ${keep})? [y/N]`);
+		if (!ok) {
+			ctx.ui.notify("fusion-housekeep: clean aborted", "info");
+			return;
+		}
+	}
+
+	for (const r of deleteSet) {
+		const abs = path.join(artifactRoot, r.dir);
+		try {
+			fs.rmSync(abs, { recursive: true, force: true });
+		} catch (e) {
+			ctx.ui.notify(`fusion-housekeep: failed to remove ${r.dir}: ${e instanceof Error ? e.message : String(e)}`, "error");
+		}
+	}
+	reconcileIndex(artifactRoot);
+	ctx.ui.notify(`fusion-housekeep: removed ${deleteSet.length} run(s); kept up to ${keep}`, "info");
+}
