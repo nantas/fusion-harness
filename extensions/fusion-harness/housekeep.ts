@@ -233,6 +233,57 @@ export function unarchivedHighValue(artifactRoot: string, rows: RunIndexRow[]): 
 	return out;
 }
 
+/** Topic → filesystem-safe slug (keeps letters/numbers including CJK). */
+export function slugFromTopic(topic: string | undefined, fallback: string, max = 48): string {
+	const raw = (topic ?? "").trim();
+	// Prefer a path-like token (docs/foo/bar.md → bar)
+	const pathHit = raw.match(/(?:[\w.-]+\/)+[\w.-]+(?:\.[\w.-]+)?/);
+	let base = pathHit ? path.basename(pathHit[0], path.extname(pathHit[0])) : raw;
+	base = base
+		.replace(/[^\p{L}\p{N}]+/gu, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, max)
+		.replace(/^-+|-+$/g, "");
+	if (!base) base = fallback.replace(/[^\p{L}\p{N}]+/gu, "-") || "run";
+	return base.toLowerCase();
+}
+
+/** Map high-value source names → destination basenames under a slug. */
+export function archiveDestNames(files: string[], slug: string): { from: string; destName: string }[] {
+	const reportNamed = files.filter((f) => f.startsWith("fused-report") && f.endsWith(".md")).sort();
+	const fusedPlain = files.filter((f) => f === "fused.md");
+	const gates = files.filter((f) => f === "gate.py");
+	const used = new Set<string>([...reportNamed, ...fusedPlain, ...gates]);
+	const other = files.filter((f) => !used.has(f));
+	const out: { from: string; destName: string }[] = [];
+	const primary = reportNamed[0] ?? fusedPlain[0];
+	if (primary) out.push({ from: primary, destName: `${slug}.md` });
+	let extra = 2;
+	for (const f of reportNamed) {
+		if (f === primary) continue;
+		out.push({ from: f, destName: `${slug}-report${extra++}.md` });
+	}
+	for (const f of fusedPlain) {
+		if (f === primary) continue;
+		out.push({ from: f, destName: `${slug}-fused.md` });
+	}
+	gates.forEach((f, i) => {
+		out.push({ from: f, destName: i === 0 ? `${slug}-gate.py` : `${slug}-gate${i + 1}.py` });
+	});
+	for (const f of other) {
+		const ext = path.extname(f) || "";
+		const stem = path.basename(f, ext) || "file";
+		out.push({ from: f, destName: `${slug}-${stem}${ext}` });
+	}
+	return out;
+}
+
+function resolveArchiveTargetDir(cwd: string, input: string): string {
+	const trimmed = input.trim();
+	const abs = path.isAbsolute(trimmed) ? trimmed : path.join(cwd, trimmed);
+	return abs;
+}
+
 async function confirmYes(ctx: { ui: { input?: (p: string, d?: string) => Promise<string | undefined>; notify: (m: string, l?: string) => void } }, prompt: string): Promise<boolean> {
 	if (typeof ctx.ui.input !== "function") {
 		ctx.ui.notify("fusion-housekeep: no interactive input — aborting destructive action", "warning");
@@ -310,9 +361,6 @@ export async function handleHousekeep(
 		const abs = path.join(artifactRoot, run.dir);
 		const files = highValueFiles(abs);
 		if (!files.length) {
-			run.archived = true;
-			upsertIndexRow(artifactRoot, run);
-			// re-write full reconciled with archived flag
 			const all = reconcileIndex(artifactRoot);
 			const r = all.find((x) => x.dir === run.dir);
 			if (r) {
@@ -322,23 +370,53 @@ export async function handleHousekeep(
 			ctx.ui.notify(`fusion-housekeep: ${run.dir} — no high-value files; marked archived`, "info");
 			return;
 		}
+		if (typeof ctx.ui.input !== "function") {
+			ctx.ui.notify("fusion-housekeep: archive needs interactive input (or pass paths via agent later)", "warning");
+			return;
+		}
+		const cwd = ctx.cwd ?? process.cwd();
+		const topic = run.prompt ?? readPromptTopic(abs) ?? shortDir(run.dir);
+		const slug = slugFromTopic(topic, shortDir(run.dir));
+		const dirAns = (await ctx.ui.input(`Target folder for archive (empty=cancel):`, "docs/plans"))?.trim() ?? "";
+		if (!dirAns) {
+			ctx.ui.notify("fusion-housekeep: archive cancelled", "info");
+			return;
+		}
+		const targetDir = resolveArchiveTargetDir(cwd, dirAns);
+		const planned = archiveDestNames(files, slug).map(({ from, destName }) => ({
+			from,
+			fromAbs: path.join(abs, from),
+			toAbs: path.join(targetDir, destName),
+			destName,
+		}));
+		const preview = planned.map((p) => `  ${p.from}  →  ${path.relative(cwd, p.toAbs) || p.toAbs}`).join("\n");
+		ctx.ui.notify(`Archive plan (slug: ${slug}):\n${preview}`, "info");
+		const ok = await confirmYes(ctx, "Copy these files? [y/N]");
+		if (!ok) {
+			ctx.ui.notify("fusion-housekeep: archive cancelled", "info");
+			return;
+		}
 		const copied: { from: string; to: string }[] = [...(run.copied ?? [])];
-		for (const name of files) {
-			const from = path.join(abs, name);
-			if (typeof ctx.ui.input !== "function") {
-				ctx.ui.notify(`fusion-housekeep: skip ${name} (no input API)`, "warning");
-				continue;
-			}
-			const dest = (await ctx.ui.input(`Copy ${name} to (empty=skip):`, ""))?.trim() ?? "";
-			if (!dest) continue;
-			const toAbs = path.isAbsolute(dest) ? dest : path.join(ctx.cwd ?? process.cwd(), dest);
+		try {
+			fs.mkdirSync(targetDir, { recursive: true });
+		} catch (e) {
+			ctx.ui.notify(`fusion-housekeep: cannot create ${targetDir}: ${e instanceof Error ? e.message : String(e)}`, "error");
+			return;
+		}
+		for (const p of planned) {
 			try {
-				fs.mkdirSync(path.dirname(toAbs), { recursive: true });
-				fs.copyFileSync(from, toAbs);
-				copied.push({ from: name, to: toAbs });
-				ctx.ui.notify(`copied ${name} → ${toAbs}`, "info");
+				// avoid clobber silently: if exists, append short dir id before ext
+				let toAbs = p.toAbs;
+				if (fs.existsSync(toAbs)) {
+					const ext = path.extname(toAbs);
+					const stem = toAbs.slice(0, toAbs.length - ext.length);
+					toAbs = `${stem}-${shortDir(run.dir)}${ext}`;
+				}
+				fs.copyFileSync(p.fromAbs, toAbs);
+				copied.push({ from: p.from, to: toAbs });
+				ctx.ui.notify(`copied ${p.from} → ${path.relative(cwd, toAbs) || toAbs}`, "info");
 			} catch (e) {
-				ctx.ui.notify(`fusion-housekeep: failed to copy ${name}: ${e instanceof Error ? e.message : String(e)}`, "error");
+				ctx.ui.notify(`fusion-housekeep: failed ${p.from}: ${e instanceof Error ? e.message : String(e)}`, "error");
 			}
 		}
 		const all = reconcileIndex(artifactRoot);
@@ -346,9 +424,10 @@ export async function handleHousekeep(
 		if (r) {
 			r.archived = true;
 			r.copied = copied;
+			r.prompt = r.prompt ?? topic;
 			writeIndex(artifactRoot, all);
 		}
-		ctx.ui.notify(`fusion-housekeep: ${run.dir} archived (${copied.length} file(s) copied)`, "info");
+		ctx.ui.notify(`fusion-housekeep: ${run.dir} archived (${copied.length} file(s) → ${path.relative(cwd, targetDir) || targetDir})`, "info");
 		return;
 	}
 
