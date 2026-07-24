@@ -2521,7 +2521,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── /fusion-housekeep status|archive|clean ───────────────
 	pi.registerCommand("fusion-housekeep", {
-		description: "Manage fusion-harness run artifacts: status | archive [dir] | clean [--keep N|--all]",
+		description: "Manage fusion-harness runs: status | archive [dir] (agent inventory) | apply <dir> src=dest... | clean",
 		handler: async (raw, ctx) => {
 			await handleHousekeep(raw ?? "", ctx, ARTIFACT_ROOT);
 		},
