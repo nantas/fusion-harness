@@ -1,0 +1,21 @@
+{
+  "name": "fusion-harness",
+  "version": "0.1.0",
+  "description": "FUSE frontier models instead of racing them. AND, not OR. Three slash commands: /opinion, /fusion, /auto-validate.",
+  "keywords": ["pi-package", "pi-extension", "multi-model", "fusion"],
+  "license": "MIT",
+  "author": {
+    "name": "Dan Eisler (IndyDevDan)"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nantas/fusion-harness.git"
+  },
+  "type": "module",
+  "main": "./extensions/fusion-harness/fusion-harness.ts",
+  "pi": {
+    "extensions": [
+      "./extensions/fusion-harness/fusion-harness.ts"
+    ]
+  }
+}
