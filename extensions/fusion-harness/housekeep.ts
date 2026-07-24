@@ -89,6 +89,18 @@ function guessCommand(runDirAbs: string): string | undefined {
 	return undefined;
 }
 
+/** First-line topic from prompt.md; strips FUSION INSTRUCTION trailer; collapses whitespace. */
+export function readPromptTopic(runDirAbs: string, max = 100): string | undefined {
+	const p = path.join(runDirAbs, "prompt.md");
+	if (!fs.existsSync(p)) return undefined;
+	let text = fs.readFileSync(p, "utf-8");
+	const cut = text.search(/\nFUSION INSTRUCTION:\s*\n/i);
+	if (cut >= 0) text = text.slice(0, cut);
+	const line = text.replace(/\s+/g, " ").trim();
+	if (!line) return undefined;
+	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
 export function rowFromSummary(dirBasename: string, summary: Record<string, unknown> | null | undefined, runDirAbs?: string): RunIndexRow {
 	const s = summary ?? {};
 	const cost = typeof s.totalCostUsd === "number" ? s.totalCostUsd : undefined;
@@ -96,6 +108,7 @@ export function rowFromSummary(dirBasename: string, summary: Record<string, unkn
 	const command = typeof s.command === "string" ? s.command : runDirAbs ? guessCommand(runDirAbs) : undefined;
 	const ok = typeof s.ok === "boolean" ? s.ok : undefined;
 	const ts = runDirAbs ? dirMtimeIso(runDirAbs) : new Date().toISOString();
+	const prompt = runDirAbs ? readPromptTopic(runDirAbs) : undefined;
 	return {
 		ts,
 		command,
@@ -103,6 +116,7 @@ export function rowFromSummary(dirBasename: string, summary: Record<string, unkn
 		dir: dirBasename,
 		cost,
 		durationMs,
+		prompt,
 	};
 }
 
@@ -130,7 +144,7 @@ export function reconcileIndex(artifactRoot: string): RunIndexRow[] {
 		if (old?.copied?.length) base.copied = old.copied;
 		// Prefer fresher summary fields; keep old ts only if we have no mtime signal
 		if (old?.ts && (!summary || !fs.existsSync(abs))) base.ts = old.ts;
-		if (old?.prompt && !base.prompt) base.prompt = old.prompt;
+		if (!base.prompt && old?.prompt) base.prompt = old.prompt;
 		next.push(base);
 	}
 	// Sort newest first
@@ -165,17 +179,24 @@ export function appendIndexFromSummary(artifactRoot: string, artifactsDirAbs: st
 	upsertIndexRow(artifactRoot, row);
 }
 
+function shortDir(dir: string): string {
+	return dir.startsWith("fusion-harness-") ? dir.slice("fusion-harness-".length) : dir;
+}
+
 export function formatStatus(rows: RunIndexRow[]): string {
 	if (!rows.length) return "fusion-housekeep: no runs under .scratch/fusion-harness/";
-	const lines = ["fusion-housekeep status", "─".repeat(60)];
-	for (const r of rows) {
+	const lines = ["fusion-housekeep status", "─".repeat(72)];
+	rows.forEach((r, i) => {
 		const cmd = r.command ?? "?";
 		const ok = r.ok === true ? "ok" : r.ok === false ? "FAIL" : "?";
-		const arch = r.archived ? " archived" : "";
-		const cost = r.cost != null ? ` $${r.cost.toFixed(4)}` : "";
-		const dur = r.durationMs != null ? ` ${Math.round(r.durationMs / 1000)}s` : "";
-		lines.push(`${r.dir}  ${cmd}  ${ok}${arch}${cost}${dur}  ${r.ts}`);
-	}
+		const arch = r.archived ? " · archived" : "";
+		const cost = r.cost != null ? ` · $${r.cost.toFixed(4)}` : "";
+		const dur = r.durationMs != null ? ` · ${Math.round(r.durationMs / 1000)}s` : "";
+		const topic = r.prompt?.trim() || "(no prompt.md)";
+		lines.push(`${i + 1}. [${cmd}] ${ok}${arch}${cost}${dur}  ·  ${shortDir(r.dir)}`);
+		lines.push(`   ${topic}`);
+		lines.push(`   ${r.ts}`);
+	});
 	return lines.join("\n");
 }
 
@@ -240,7 +261,13 @@ async function pickRun(
 		return undefined;
 	}
 	if (rows.length === 1) return rows[0];
-	const list = rows.map((r, i) => `  ${i + 1}. ${r.dir}  ${r.command ?? "?"}  ${r.archived ? "archived" : ""}`).join("\n");
+	const list = rows
+		.map((r, i) => {
+			const topic = r.prompt?.trim() || "(no prompt)";
+			const arch = r.archived ? " · archived" : "";
+			return `  ${i + 1}. [${r.command ?? "?"}] ${shortDir(r.dir)}${arch}\n      ${topic}`;
+		})
+		.join("\n");
 	ctx.ui.notify(`Select run:\n${list}`, "info");
 	if (typeof ctx.ui.input !== "function") {
 		ctx.ui.notify("fusion-housekeep: pass archive <dir> when input is unavailable", "warning");
