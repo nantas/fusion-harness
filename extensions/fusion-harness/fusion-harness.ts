@@ -1678,6 +1678,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Per-run artifacts land under .scratch/fusion-harness/ in the project working directory.
 	const ARTIFACT_ROOT = path.join(process.cwd(), ".scratch", "fusion-harness");
+	fs.mkdirSync(ARTIFACT_ROOT, { recursive: true });
 	const mkArtifacts = async (): Promise<string> => fs.promises.mkdtemp(path.join(ARTIFACT_ROOT, "fusion-harness-"));
 	const save = (dir: string, name: string, body: string) =>
 		fs.promises.writeFile(path.join(dir, name), body, "utf-8").catch(() => {});
