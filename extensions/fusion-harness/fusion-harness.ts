@@ -460,9 +460,7 @@ function runChild(opts: {
 		"-p",
 		"--session-dir",
 		opts.sessionDir,
-		"--no-skills",
 		"--no-extensions",
-		"--no-context-files",
 		"--thinking",
 		opts.thinking,
 		"--model",
@@ -974,8 +972,26 @@ export default function (pi: ExtensionAPI) {
 		const v = pi.getFlag(name);
 		return typeof v === "string" ? v.trim() : "";
 	};
-	const architectModel = () => flagStr("architect") || DEFAULT_ARCHITECT; // resolved per call — flags are static, but cheap to re-read
-	const builderModel = () => flagStr("builder") || DEFAULT_BUILDER;
+	/** Cached fusionHarness settings from .pi/settings.json — read once. */
+	let _fusionSettingsCache: { architect?: string; builder?: string } | null = null;
+	const fusionSettings = (): { architect?: string; builder?: string } => {
+		if (_fusionSettingsCache) return _fusionSettingsCache;
+		try {
+			const settingsPath = path.join(process.cwd(), ".pi", "settings.json");
+			if (fs.existsSync(settingsPath)) {
+				const raw = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				_fusionSettingsCache = raw.fusionHarness || {};
+			} else {
+				_fusionSettingsCache = {};
+			}
+		} catch {
+			_fusionSettingsCache = {};
+		}
+		return _fusionSettingsCache;
+	};
+
+	const architectModel = () => flagStr("architect") || fusionSettings().architect || DEFAULT_ARCHITECT;
+	const builderModel = () => flagStr("builder") || fusionSettings().builder || DEFAULT_BUILDER;
 
 	/** --<role>-system-prompt: inline text, or a file path (file contents win if it exists). */
 	const roleSystemPrompt = (role: "architect" | "builder"): string | undefined => {
@@ -1044,8 +1060,14 @@ export default function (pi: ExtensionAPI) {
 	const roleThinking = (role: "architect" | "builder"): Thinking => {
 		const override = thinkingOverride[role];
 		if (override) return override;
-		// The boot flags take the same aliases, so `--architect-thinking hi` works too.
-		return resolveThinking(flagStr(`${role}-thinking`)) ?? "medium";
+		const flag = resolveThinking(flagStr(`${role}-thinking`));
+		if (flag) return flag;
+		const settingsThinking = fusionSettings()[`${role}Thinking`];
+		if (typeof settingsThinking === "string") {
+			const resolved = resolveThinking(settingsThinking);
+			if (resolved) return resolved;
+		}
+		return "medium";
 	};
 
 	// ── 8.3 Shared live state (widget + footer read this) ──────
@@ -1654,9 +1676,8 @@ export default function (pi: ExtensionAPI) {
 		return { signal: ctl.signal, stopped: () => ctl.signal.aborted, release };
 	};
 
-	// Per-run artifacts land under /tmp/fusion-harness-* (the spec'd, inspectable location —
-	// note os.tmpdir() on macOS is /var/folders/…, so we pin /tmp explicitly).
-	const ARTIFACT_ROOT = fs.existsSync("/tmp") ? "/tmp" : os.tmpdir();
+	// Per-run artifacts land under .scratch/fusion-harness/ in the project working directory.
+	const ARTIFACT_ROOT = path.join(process.cwd(), ".scratch", "fusion-harness");
 	const mkArtifacts = async (): Promise<string> => fs.promises.mkdtemp(path.join(ARTIFACT_ROOT, "fusion-harness-"));
 	const save = (dir: string, name: string, body: string) =>
 		fs.promises.writeFile(path.join(dir, name), body, "utf-8").catch(() => {});
