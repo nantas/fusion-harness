@@ -1362,7 +1362,15 @@ export default function (pi: ExtensionAPI) {
 						// builder (recipes launch the host on the builder model), so show the host's
 						// live model + context usage rather than a stale child snapshot.
 						if (side === "right" && !live.length) {
-							const hostModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : builderModel();
+							// The BUILDER cell is the HOST when no child is running — raw input IS the
+							// builder (recipes launch the host on the builder model). But the host may
+							// have been launched on a DIFFERENT model (manual /session pick, non-recipe
+							// launch). Only show the host model when it matches the configured builder;
+							// otherwise the footer lies — actual builder children still use --model
+							// (builderModel()), which wins over fork session restore.
+							const configuredBuilder = builderModel();
+							const hostModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : configuredBuilder;
+							const showModel = hostModel === configuredBuilder ? hostModel : configuredBuilder;
 							const usage = ctx.getContextUsage?.();
 							// The host only HAS usage once it has answered a turn itself. A session
 							// driven purely by slash commands never does, leaving the cell at 0% while
@@ -1374,12 +1382,12 @@ export default function (pi: ExtensionAPI) {
 							// reading is discarded with its fork, so it can't be the sole source either.
 							// Taking the larger keeps the bar from collapsing to 0% right after real work.
 							const used = Math.max(usage?.tokens ?? 0, sideLast.right?.ctxTokens ?? 0);
-							const window = usage?.contextWindow ?? contextWindow(hostModel);
+							const window = usage?.contextWindow ?? contextWindow(showModel);
 							// --builder-thinking, i.e. the level every builder CHILD runs at. The host's
 							// own live level would be truer for this cell, but ExtensionContext exposes
 							// no getThinkingLevel (it's command-context only) and emits no
 							// thinking_level_changed event, so it isn't reachable from a footer.
-							return cellStr(theme, "BUILDER", hostModel, roleThinking("builder"), bar(used, window));
+							return cellStr(theme, "BUILDER", showModel, roleThinking("builder"), bar(used, window));
 						}
 						const model = active?.model ?? (side === "left" ? architectModel() : builderModel());
 						const thinking = active?.thinking ?? roleThinking(side === "left" ? "architect" : "builder");
