@@ -18,6 +18,8 @@ export type RunIndexRow = {
 	cost?: number;
 	durationMs?: number;
 	prompt?: string;
+	mode?: string; // "merge-only" when a /fusion reused a prior run's answers
+	sourceDir?: string; // merge-only: the reused run dir (resolved absolute)
 	archived?: boolean;
 	copied?: { from: string; to: string }[];
 };
@@ -143,7 +145,9 @@ export function rowFromSummary(dirBasename: string, summary: Record<string, unkn
 	const ok = typeof s.ok === "boolean" ? s.ok : undefined;
 	const ts = runDirAbs ? dirMtimeIso(runDirAbs) : new Date().toISOString();
 	const prompt = runDirAbs ? readPromptTopic(runDirAbs) : undefined;
-	return { ts, command, ok, dir: dirBasename, cost, durationMs, prompt };
+	const mode = typeof s.mode === "string" ? s.mode : undefined;
+	const sourceDir = typeof s.sourceDir === "string" ? s.sourceDir : undefined;
+	return { ts, command, ok, dir: dirBasename, cost, durationMs, prompt, mode, sourceDir };
 }
 
 function loadSummary(runDirAbs: string): Record<string, unknown> | null {

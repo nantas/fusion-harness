@@ -75,6 +75,37 @@ import {
 	reconcileIndex,
 	resolveRun,
 } from "./housekeep";
+import { parseMergeExistingFlag, resolveMergeDir, loadMergeSource } from "./merge-source";
+import { resolveChildExtensionEntries, readAllPackages, defaultAgentHome } from "./child-extensions";
+
+/** Resolve fusionHarness.childExtensions to `-e` entry paths for child injection. Module-level
+ *  (runChild is module-level; this must be too). Cached per process. */
+let _childExtEntriesCache: string[] | null = null;
+const childExtensionEntries = (cwd: string): string[] => {
+	if (_childExtEntriesCache) return _childExtEntriesCache;
+	// Read fusionHarness.childExtensions from project settings (project cwd) + global settings.
+	const readChildExts = (settingsPath: string): string[] | undefined => {
+		try {
+			const raw = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+			return Array.isArray(raw?.fusionHarness?.childExtensions) ? raw.fusionHarness.childExtensions : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	const projectExts = readChildExts(path.join(cwd, ".pi", "settings.json"));
+	const globalExts = readChildExts(path.join(defaultAgentHome(), "settings.json"));
+	const childExts = projectExts ?? globalExts;
+	if (!childExts || childExts.length === 0) {
+		_childExtEntriesCache = [];
+		return _childExtEntriesCache;
+	}
+	const agentHome = defaultAgentHome();
+	const projectSettings = path.join(cwd, ".pi", "settings.json");
+	const globalSettings = path.join(agentHome, "settings.json");
+	const packages = readAllPackages(projectSettings, globalSettings);
+	_childExtEntriesCache = resolveChildExtensionEntries(childExts, packages, agentHome);
+	return _childExtEntriesCache;
+};
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Box, Container, Markdown, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
@@ -476,6 +507,12 @@ function runChild(opts: {
 		"--model",
 		run.model,
 	];
+	// Inject configured child extensions (e.g. pi-xai for grok-build provider) after
+	// --no-extensions. Prevents recursive fusion-harness loading while keeping
+	// provider-registering extensions functional in children.
+	for (const entry of childExtensionEntries(opts.cwd)) {
+		args.push("-e", entry);
+	}
 	// Session identity, in precedence order: fork the host > resume an earlier fork > pinned per-role id.
 	if (opts.fork) args.push("--fork", opts.fork);
 	else if (opts.resume) args.push("--session", opts.resume);
@@ -983,8 +1020,8 @@ export default function (pi: ExtensionAPI) {
 		return typeof v === "string" ? v.trim() : "";
 	};
 	/** Cached fusionHarness settings from .pi/settings.json — read once. */
-	let _fusionSettingsCache: { architect?: string; builder?: string } | null = null;
-	const fusionSettings = (): { architect?: string; builder?: string } => {
+	let _fusionSettingsCache: { architect?: string; builder?: string; childExtensions?: string[] } | null = null;
+	const fusionSettings = (): { architect?: string; builder?: string; childExtensions?: string[] } => {
 		if (_fusionSettingsCache) return _fusionSettingsCache;
 		try {
 			const settingsPath = path.join(process.cwd(), ".pi", "settings.json");
@@ -1793,12 +1830,127 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── 8.12 /fusion <prompt> [:: <fusion-prompt>] ─────────────
+	// Shared merge-only core: spawn fuser over an existing run's two answers, return result.
+	// Slash command wraps this with live panels + stopper; the agent tool wraps it with a text result.
+	type MergeOnlyResult = {
+		ok: boolean;
+		fusedPath: string;
+		sourceDir: string;
+		fusedText: string;
+		error?: string;
+	};
+	const runMergeOnly = async (
+		resolvedDir: string,
+		instruction: string,
+		cwd: string,
+		opts: { signal?: AbortSignal; notify?: (msg: string, level: "info" | "error") => void } = {},
+	): Promise<MergeOnlyResult> => {
+		const aModel = architectModel();
+		const bModel = builderModel();
+		const loaded = loadMergeSource(resolvedDir, aModel, bModel);
+		if ("error" in loaded) {
+			return { ok: false, fusedPath: "", sourceDir: resolvedDir, fusedText: "", error: loaded.error };
+		}
+		const fusionInstruction = instruction.trim() || defaultFusionPrompt();
+		const startedAt = Date.now();
+		const artifactsDir = await mkArtifacts();
+		const sourceLabel = path.basename(resolvedDir);
+		await save(artifactsDir, "prompt.md", `${loaded.prompt}\n\nFUSION INSTRUCTION:\n${fusionInstruction}\n\nMERGE-ONLY SOURCE: ${resolvedDir}`);
+		let summarySaved = false;
+		const commitSummary = async (summary: Record<string, unknown>) => {
+			summarySaved = true;
+			await saveSummary(artifactsDir, summary);
+		};
+
+		const fuser = newRun("FUSION", aModel);
+		try {
+			await runChild({
+				run: fuser,
+				prompt: fuserPrompt(fusionInstruction, loaded.prompt, loaded.a, loaded.b, aModel, roleThinking("architect"), artifactsDir),
+				systemPrompt: roleSystemPrompt("architect"),
+				tools: FULL_TOOLS,
+				thinking: roleThinking("architect"),
+				sessionDir: path.join(artifactsDir, "fusion"),
+				cwd,
+				timeoutMs: childTimeoutMs(),
+				signal: opts.signal,
+			});
+			const fusedText = runOk(fuser) ? fuser.text : `FAILED: ${runError(fuser)}`;
+			await save(artifactsDir, "fused.md", fusedText);
+			const t = totals([fuser], startedAt);
+			await commitSummary({ command: "fusion", mode: "merge-only", sourceDir: resolvedDir, ok: runOk(fuser), agents: [toStat(fuser)], prompt: loaded.prompt, ...t });
+			opts.notify?.(`merge-only ${runOk(fuser) ? "done" : "failed"} · ${sourceLabel}`, runOk(fuser) ? "info" : "error");
+			return {
+				ok: runOk(fuser),
+				fusedPath: path.join(artifactsDir, "fused.md"),
+				sourceDir: resolvedDir,
+				fusedText,
+				error: runOk(fuser) ? undefined : runError(fuser),
+			};
+		} catch (e: any) {
+			return { ok: false, fusedPath: "", sourceDir: resolvedDir, fusedText: "", error: String(e?.message ?? e) };
+		} finally {
+			if (!summarySaved) {
+				await commitSummary({ command: "fusion", mode: "merge-only", sourceDir: resolvedDir, ok: false, partial: true });
+			}
+		}
+	};
+
 	pi.registerCommand("fusion", {
 		description: 'ARCHITECT + BUILDER answer in parallel (two live columns), then a fusion agent merges them — /fusion "prompt" "fusion-prompt" (or `prompt :: fusion-prompt`)',
 		handler: async (raw, ctx) => {
 			const input = (raw ?? "").trim();
 			if (!input) {
-				ctx.ui.notify('Usage: /fusion "<prompt>" "<fusion-prompt>"  (or: /fusion <prompt> :: <fusion-prompt>)', "warning");
+				ctx.ui.notify('Usage: /fusion "<prompt>" "<fusion-prompt>"  (or: /fusion <prompt> :: <fusion-prompt>  ·  merge-only: /fusion --merge-existing <dir> [fusion-prompt])', "warning");
+				return;
+			}
+
+			// ── merge-only: reuse a prior run's two answers, skip Stage 1 worker re-run ──
+			const mergeFlag = parseMergeExistingFlag(input);
+			if (mergeFlag) {
+				const resolved = resolveMergeDir(mergeFlag.dir, ctx.cwd, ARTIFACT_ROOT);
+				if (!resolved) {
+					ctx.ui.notify(`merge-existing: source dir not found: ${mergeFlag.dir} (tried absolute, relative to cwd, and under .scratch/fusion-harness/)`, "error");
+					return;
+				}
+				// Pre-flight validation: refuse early before panels if inputs are bad.
+				const probe = loadMergeSource(resolved, architectModel(), builderModel());
+				if ("error" in probe) {
+					ctx.ui.notify(`merge-existing: ${probe.error}`, "error");
+					return;
+				}
+				const sourceLabel = path.basename(resolved);
+				const fusionInstr = mergeFlag.rest.trim() || defaultFusionPrompt();
+				panel({ kind: "prompt", command: "fusion", ok: true }, `/fusion ${input}`);
+				panel(
+					{
+						kind: "banner",
+						command: "fusion",
+						ok: true,
+						prompt: probe.prompt,
+						fusionPrompt: fusionInstr,
+						roles: [
+							{ role: "ARCHITECT", model: probe.a.model },
+							{ role: "BUILDER", model: probe.b.model },
+							{ role: "FUSION", model: architectModel() },
+						],
+						artifactsDir: "(pending)",
+					},
+					`MERGE-ONLY · source: ${sourceLabel} (workers skipped; reusing existing answers, not re-running them)`,
+				);
+				const stopper = startStoppable(ctx, "fusion");
+				ctx.ui.setStatus(CUSTOM_TYPE, `fusion: merge-only (source ${sourceLabel})…`);
+				try {
+					const result = await runMergeOnly(resolved, mergeFlag.rest, ctx.cwd, { signal: stopper.signal });
+					if (result.ok) {
+						panel({ kind: "fused", command: "fusion", ok: true, sources: [], artifactsDir: path.dirname(result.fusedPath) }, result.fusedText);
+					} else {
+						panel({ kind: "error", command: "fusion", ok: false, artifactsDir: result.fusedPath ? path.dirname(result.fusedPath) : "" }, `MERGE-ONLY fusion failed (the source answers at ${sourceLabel} remain valid on disk).${result.error ? ` ${result.error}` : ""}`);
+					}
+				} finally {
+					stopper.release();
+					ctx.ui.setStatus(CUSTOM_TYPE, undefined);
+				}
 				return;
 			}
 			const parsed = parseFusionArgs(input);
@@ -2578,6 +2730,33 @@ export default function (pi: ExtensionAPI) {
 			const cwd = ctx?.cwd ?? process.cwd();
 			const result = applyArchiveMaps(ARTIFACT_ROOT, run, params.mappings, cwd);
 			return toolText(JSON.stringify(result, null, 2));
+		},
+	});
+
+	pi.registerTool({
+		name: "fusion_merge",
+		label: "Fusion merge",
+		description: "Run a merge-only fusion over an existing run's two answers (architect.md + builder.md) — spawns a fuser agent, writes fused.md, returns the result. Use this when the user asks to fuse/merge/combine two prior opinions or a prior fusion's answers without re-running the workers. Pass dir/id from fusion_list_runs.",
+		parameters: Type.Object({
+			runDir: Type.String({ description: "Run dir, short id, or basename (e.g. WWZXdd or fusion-harness-WWZXdd) — from fusion_list_runs" }),
+			instruction: Type.Optional(Type.String({ description: "Optional fusion instruction forwarded to the fuser (e.g. 'focus on consensus, flag divergence'). Defaults to the standard merge prompt." })),
+		}),
+		async execute(_id, params: { runDir: string; instruction?: string }, _sig, _up, ctx: any) {
+			const cwd = ctx?.cwd ?? process.cwd();
+			const resolved = resolveMergeDir(params.runDir, cwd, ARTIFACT_ROOT);
+			if (!resolved) {
+				return toolText(JSON.stringify({ ok: false, error: `run dir not found: ${params.runDir} (tried absolute, relative to cwd, and under .scratch/fusion-harness/)` }));
+			}
+			const result = await runMergeOnly(resolved, params.instruction ?? "", cwd);
+			const payload = {
+				ok: result.ok,
+				mode: "merge-only",
+				sourceDir: result.sourceDir,
+				fusedPath: result.fusedPath,
+				summary: result.ok ? result.fusedText.slice(0, 2000) : "",
+				...(result.error ? { error: result.error } : {}),
+			};
+			return toolText(JSON.stringify(payload, null, 2));
 		},
 	});
 
