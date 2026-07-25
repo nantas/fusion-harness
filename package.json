@@ -1,6 +1,6 @@
 {
   "name": "fusion-harness",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "FUSE frontier models instead of racing them. AND, not OR. Commands: /opinion, /fusion, /auto-validate, /fusion-housekeep.",
   "keywords": [
     "pi-package",
