@@ -1020,20 +1020,29 @@ export default function (pi: ExtensionAPI) {
 		return typeof v === "string" ? v.trim() : "";
 	};
 	/** Cached fusionHarness settings from .pi/settings.json — read once. */
-	let _fusionSettingsCache: { architect?: string; builder?: string; childExtensions?: string[] } | null = null;
-	const fusionSettings = (): { architect?: string; builder?: string; childExtensions?: string[] } => {
+	let _fusionSettingsCache: { architect?: string; builder?: string; architectThinking?: string; builderThinking?: string; childExtensions?: string[] } | null = null;
+	const fusionSettings = (): { architect?: string; builder?: string; architectThinking?: string; builderThinking?: string; childExtensions?: string[] } => {
 		if (_fusionSettingsCache) return _fusionSettingsCache;
-		try {
-			const settingsPath = path.join(process.cwd(), ".pi", "settings.json");
-			if (fs.existsSync(settingsPath)) {
+		// Read fusionHarness block: project-level settings win per-key over global settings.
+		// (Matches pi's own config precedence: project > global > built-in defaults.)
+		const readBlock = (settingsPath: string): Record<string, unknown> => {
+			try {
+				if (!fs.existsSync(settingsPath)) return {};
 				const raw = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
-				_fusionSettingsCache = raw.fusionHarness || {};
-			} else {
-				_fusionSettingsCache = {};
+				return (raw?.fusionHarness && typeof raw.fusionHarness === "object") ? raw.fusionHarness : {};
+			} catch {
+				return {};
 			}
-		} catch {
-			_fusionSettingsCache = {};
+		};
+		const projectBlock = readBlock(path.join(process.cwd(), ".pi", "settings.json"));
+		const globalBlock = readBlock(path.join(defaultAgentHome(), "settings.json"));
+		// Per-key merge: project value wins if defined; otherwise global; otherwise undefined.
+		const merged: Record<string, unknown> = {};
+		const keys = new Set([...Object.keys(globalBlock), ...Object.keys(projectBlock)]);
+		for (const k of keys) {
+			merged[k] = projectBlock[k] ?? globalBlock[k];
 		}
+		_fusionSettingsCache = merged as any;
 		return _fusionSettingsCache;
 	};
 
