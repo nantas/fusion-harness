@@ -1764,7 +1764,7 @@ export default function (pi: ExtensionAPI) {
 	// banner on /new, /resume, forks, or extension reloads.
 	pi.on("session_start", async (ev: any, ctx: any) => {
 		if (ctx.mode !== "tui" || ev?.reason !== "startup") return;
-		panel({ kind: "boot", ok: true }, "FUSION HARNESS");
+		panel({ kind: "boot", ok: true }, "");
 	});
 
 	// ── 8.9 /fh-reset — wipe the persistent role sessions for this project ──
