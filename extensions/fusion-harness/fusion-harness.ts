@@ -796,8 +796,8 @@ function fill(file: string, vars: Record<string, string>): string {
 }
 
 /** The /fusion parallel-worker prompt — each worker knows its own role AND its counterpart. */
-function workerPrompt(role: Role, model: string, otherRole: Role, otherModel: string, prompt: string): string {
-	return fill("USER_PROMPT_FUSION_WORKER.md", { ROLE: role, MODEL: model, OTHER_ROLE: otherRole, OTHER_MODEL: otherModel, PROMPT: prompt });
+function workerPrompt(role: Role, model: string, otherRole: Role, otherModel: string, prompt: string, artifactsDir: string): string {
+	return fill("USER_PROMPT_FUSION_WORKER.md", { ROLE: role, MODEL: model, OTHER_ROLE: otherRole, OTHER_MODEL: otherModel, PROMPT: prompt, ARTIFACTS_DIR: artifactsDir });
 }
 
 /** The built-in critical-merge instruction, used when /fusion gets no explicit fusion prompt. */
@@ -2016,7 +2016,7 @@ export default function (pi: ExtensionAPI) {
 				await Promise.all([
 					runChild({
 						run: architect,
-						prompt: workerPrompt("ARCHITECT", aModel, "BUILDER", bModel, prompt),
+						prompt: workerPrompt("ARCHITECT", aModel, "BUILDER", bModel, prompt, artifactsDir),
 						systemPrompt: roleSystemPrompt("architect"),
 						tools: FULL_TOOLS,
 						thinking: roleThinking("architect"),
@@ -2028,7 +2028,7 @@ export default function (pi: ExtensionAPI) {
 					}),
 					runChild({
 						run: builder,
-						prompt: workerPrompt("BUILDER", bModel, "ARCHITECT", aModel, prompt),
+						prompt: workerPrompt("BUILDER", bModel, "ARCHITECT", aModel, prompt, artifactsDir),
 						systemPrompt: roleSystemPrompt("builder"),
 						tools: FULL_TOOLS,
 						thinking: roleThinking("builder"),
